@@ -57,6 +57,8 @@ critical-section = "1.2.0"
 embassy-sync = "0.6.2"
 embedded-can = "0.4.1"
 
+robocon-rs = { git = "https://github.com/netetra/robocon-rs.git" }
+
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization

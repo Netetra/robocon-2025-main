@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
+
+use alloc::boxed::Box;
+use critical_section::Mutex;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
@@ -22,13 +26,21 @@ use esp_hal::{
     },
     Async,
 };
-use esp_wifi::esp_now::EspNow;
+use esp_wifi::esp_now::{EspNow, EspNowReceiver};
+use robocon_rs::{
+    components::gamepad::Gamepad,
+    node::{command::Command, message::EspNowMessage},
+    util::sized_slice,
+};
 use static_cell::StaticCell;
 use {defmt_rtt as _, esp_backtrace as _};
 
 extern crate alloc;
 
-static LED_FLASH_TIME_MS: u64 = 20;
+const NODE_ID: u8 = 0x00;
+const LED_FLASH_TIME_MS: u64 = 20;
+
+static GAMEPAD: Mutex<RefCell<Option<Gamepad>>> = Mutex::new(RefCell::new(None));
 
 fn peripherals_init(cpu_clock: CpuClock) -> Peripherals {
     let mut config = esp_hal::Config::default();
@@ -80,6 +92,31 @@ async fn led_flash(
     }
 }
 
+#[embassy_executor::task]
+async fn esp_now_recv(mut esp_now_rx: EspNowReceiver<'static>) {
+    loop {
+        let recv = esp_now_rx.receive_async().await;
+        if let Some(message) = EspNowMessage::from_slice(recv.data()) {
+            let (_, to, command, payload) = message.split();
+            if to == NODE_ID.into() {
+                match command {
+                    Command::NotifyGamepadState => {
+                        if payload.len() == 9 {
+                            critical_section::with(|cs| {
+                                let mut gamepad = GAMEPAD.borrow_ref_mut(cs);
+                                let gamepad = gamepad.as_mut().unwrap();
+                                let new_state = Gamepad::from(sized_slice::<9>(&payload).unwrap());
+                                gamepad.update(&new_state);
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[main]
 async fn main(spawner: Spawner) {
     let peripherals = peripherals_init(CpuClock::max());
@@ -94,19 +131,22 @@ async fn main(spawner: Spawner) {
     );
     info!("Embassy initialized.");
 
-    let wifi_ctrl = esp_wifi::init(
-        timg0.timer0,
-        Rng::new(peripherals.RNG),
-        peripherals.RADIO_CLK,
-    )
-    .unwrap();
-    let esp_now = EspNow::new(&wifi_ctrl, peripherals.WIFI).unwrap();
+    let wifi_ctrl = Box::new(
+        esp_wifi::init(
+            timg0.timer0,
+            Rng::new(peripherals.RNG),
+            peripherals.RADIO_CLK,
+        )
+        .unwrap(),
+    );
+    let esp_now = EspNow::new(Box::leak(wifi_ctrl), peripherals.WIFI).unwrap();
     info!(
         "ESP Now initialized. version: {}",
         esp_now.version().unwrap()
     );
+    let (_, _esp_now_tx, esp_now_rx) = esp_now.split();
 
-    let mut twai = twai_init(
+    let mut _twai = twai_init(
         peripherals.TWAI0,
         SingleExtendedFilter::new(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxx", b"x"),
         BaudRate::B1000K,
@@ -116,12 +156,62 @@ async fn main(spawner: Spawner) {
     );
     info!("TWAI initialized.");
 
-    let led_ctrl = led_init(&spawner, peripherals.GPIO7);
+    let _led_ctrl = led_init(&spawner, peripherals.GPIO7);
     info!("LED Indicator initialized.");
 
-    let _ = spawner;
+    critical_section::with(|cs| {
+        GAMEPAD.borrow_ref_mut(cs).replace(Gamepad::default());
+    });
+
+    let _ = spawner.spawn(esp_now_recv(esp_now_rx)).unwrap();
+    info!("ESP Now receive task spawn.");
 
     loop {
-        Timer::after(Duration::from_millis(500)).await;
+        critical_section::with(|cs| {
+            let mut gamepad = GAMEPAD.borrow_ref_mut(cs);
+            let gamepad = gamepad.as_mut().unwrap();
+            println!("");
+            println!(
+                "Joystick: left {}, right {}",
+                gamepad.left_joystick(),
+                gamepad.right_joystick()
+            );
+            println!(
+                "Trigger: left {}, right {}",
+                gamepad.l2_value(),
+                gamepad.r2_value()
+            );
+            println!(
+                "A: {}, B: {}, X: {}, Y: {}",
+                gamepad.is_circle_pushed(),
+                gamepad.is_cross_pushed(),
+                gamepad.is_triangle_pushed(),
+                gamepad.is_square_pushed(),
+            );
+            println!(
+                "Up: {}, Down: {}, Left: {}, Right: {}",
+                gamepad.is_up_pushed(),
+                gamepad.is_down_pushed(),
+                gamepad.is_left_pushed(),
+                gamepad.is_right_pushed(),
+            );
+            println!(
+                "L1: {}, R1: {}, L2: {}, R2: {}, L3: {}, R3: {}",
+                gamepad.is_l1_pushed(),
+                gamepad.is_r1_pushed(),
+                gamepad.is_l2_pushed(),
+                gamepad.is_r2_pushed(),
+                gamepad.is_l3_pushed(),
+                gamepad.is_r3_pushed(),
+            );
+            println!(
+                "Select: {}, Start: {}, Share: {}, Home: {}",
+                gamepad.is_select_pushed(),
+                gamepad.is_start_pushed(),
+                gamepad.is_share_pushed(),
+                gamepad.is_home_pushed(),
+            );
+        });
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
